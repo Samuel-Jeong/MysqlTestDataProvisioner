@@ -1,10 +1,6 @@
 # Project specific directories (keep example, ignore others)
-config/*
-!config/wpm/
-!config/example/
-scenario/*
-!scenario/wpm/
-!scenario/example/
+config/
+scenario/
 
 # Work directory (run logs)
 work/
