@@ -143,6 +143,10 @@ def load_connection_config(profile: str) -> Dict[str, Any]:
     with open(conn_file, "r", encoding="utf-8") as f:
         config = json.load(f)
     
+    # localhost를 127.0.0.1로 변경 (TCP 연결 강제, Unix socket 문제 방지)
+    if config.get("host", "").lower() == "localhost":
+        config["host"] = "127.0.0.1"
+    
     return config
 
 
@@ -223,6 +227,16 @@ class MySQLSchemaParser:
                 schema.tables[table_info.name] = table_info
 
         return schema
+    
+    def get_create_statements(self) -> List[str]:
+        """스키마 파일에서 CREATE TABLE 문들을 추출"""
+        if not os.path.exists(self.schema_file):
+            raise FileNotFoundError(f"스키마 파일을 찾을 수 없습니다: {self.schema_file}")
+
+        with open(self.schema_file, "r", encoding="utf-8") as f:
+            sql = f.read()
+
+        return self._split_create_table_blocks(sql)
 
     def _split_create_table_blocks(self, sql: str) -> List[str]:
         blocks = []
@@ -298,14 +312,23 @@ class MySQLSchemaParser:
                     col_type = parts[1]
                     is_nullable = "NOT NULL" not in line.upper()
                     has_default = "DEFAULT" in line.upper()
+                    
+                    # 인라인 PRIMARY KEY 체크 (예: `id` INT AUTO_INCREMENT PRIMARY KEY)
+                    is_primary = "PRIMARY KEY" in line.upper()
+                    
                     col = ColumnInfo(
                         name=col_name,
                         type=col_type,
-                        is_primary=False,  # 이후 PRIMARY KEY에서 세팅
+                        is_primary=is_primary,
                         is_nullable=is_nullable,
                         has_default=has_default,
                     )
                     table.columns.append(col)
+                    
+                    # 인라인 PRIMARY KEY인 경우 테이블의 primary_key 설정
+                    if is_primary and not table.primary_key:
+                        table.primary_key = col_name
+                        
                 except Exception:
                     # 파싱 실패 시 무시
                     continue
@@ -354,6 +377,108 @@ class ScenarioLoader:
             )
 
         return ScenarioInfo(tables=tables)
+
+
+# ==========================
+# 스키마 생성 매니저
+# ==========================
+
+class SchemaCreator:
+    """
+    스키마 파일을 읽어서 실제 DB에 테이블 생성
+    - 기존 테이블은 건드리지 않음
+    - 없는 테이블만 생성
+    """
+    
+    def __init__(self, schema_file: str, db_config: Dict[str, Any]):
+        self.schema_file = schema_file
+        self.db_config = db_config
+        self.conn = None
+    
+    def connect(self):
+        self.conn = mysql.connector.connect(**self.db_config)
+    
+    def close(self):
+        if self.conn:
+            self.conn.close()
+            self.conn = None
+    
+    def get_existing_tables(self) -> List[str]:
+        """DB에 존재하는 테이블 목록 조회"""
+        if not self.conn:
+            self.connect()
+        
+        cursor = self.conn.cursor()
+        cursor.execute("SHOW TABLES")
+        tables = [row[0] for row in cursor.fetchall()]
+        cursor.close()
+        return tables
+    
+    def create_missing_tables(self, progress_callback=None) -> Dict[str, str]:
+        """
+        스키마 파일의 테이블 중 DB에 없는 것만 생성
+        반환: {"table_name": "success|error_message", ...}
+        """
+        if not self.conn:
+            self.connect()
+        
+        # 기존 테이블 조회
+        existing_tables = self.get_existing_tables()
+        
+        # CREATE TABLE 문 추출
+        parser = MySQLSchemaParser(self.schema_file)
+        create_statements = parser.get_create_statements()
+        
+        results = {}
+        cursor = self.conn.cursor()
+        
+        for idx, statement in enumerate(create_statements):
+            # 테이블 이름 추출
+            table_name = self._extract_table_name(statement)
+            if not table_name:
+                continue
+            
+            if progress_callback:
+                progress_callback(table_name, idx + 1, len(create_statements))
+            
+            # 이미 존재하면 스킵
+            if table_name in existing_tables:
+                results[table_name] = "already_exists"
+                continue
+            
+            # 테이블 생성
+            try:
+                cursor.execute(statement)
+                self.conn.commit()
+                results[table_name] = "created"
+            except Exception as e:
+                results[table_name] = f"error: {str(e)}"
+                self.conn.rollback()
+        
+        cursor.close()
+        return results
+    
+    def _extract_table_name(self, create_statement: str) -> Optional[str]:
+        """CREATE TABLE 문에서 테이블 이름 추출"""
+        lines = create_statement.strip().split('\n')
+        if not lines:
+            return None
+        
+        first_line = lines[0].strip()
+        
+        # CREATE TABLE `table_name`
+        if "`" in first_line:
+            try:
+                return first_line.split("`", 2)[1]
+            except Exception:
+                return None
+        else:
+            # CREATE TABLE table_name
+            parts = first_line.split()
+            if len(parts) >= 3:
+                return parts[2].strip(" (;")
+        
+        return None
 
 
 # ==========================
@@ -636,23 +761,35 @@ class MySQLDumpManager:
         dump_dir = ensure_dump_dir()
         output_file = os.path.join(dump_dir, output_filename)
         
+        # localhost를 127.0.0.1로 변경 (TCP 연결 강제)
+        host = self.db_config["host"]
+        if host.lower() == "localhost":
+            host = "127.0.0.1"
+        
         cmd = [
             "mysqldump",
-            "-h", self.db_config["host"],
+            "-h", host,
             "-P", str(self.db_config["port"]),
             "-u", self.db_config["user"],
-            f"-p{self.db_config['password']}",
+            "--protocol=TCP",  # TCP 연결 강제
             self.db_config["database"],
         ]
         if tables:
             cmd.extend(tables)
 
+        # 환경 변수로 비밀번호 전달 (더 안전함)
+        env = os.environ.copy()
+        env["MYSQL_PWD"] = self.db_config["password"]
+
         try:
             with open(output_file, "w", encoding="utf-8") as f:
-                subprocess.run(cmd, stdout=f, check=True)
+                subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE, check=True, env=env)
             return f"mysqldump 완료: {output_file}"
         except subprocess.CalledProcessError as e:
-            return f"mysqldump 실패: {e}"
+            error_msg = e.stderr.decode('utf-8') if e.stderr else str(e)
+            return f"mysqldump 실패: {error_msg}"
+        except Exception as e:
+            return f"mysqldump 오류: {e}"
 
 
 # ==========================
@@ -663,9 +800,10 @@ MENU_ITEMS = [
     "1: 프로파일 선택",
     "2: 시나리오 선택", 
     "3: 스키마/시나리오 분석",
-    "4: 테스트 데이터 생성",
-    "5: 데이터 롤백",
-    "6: MySQL 덤프",
+    "4: 스키마 생성 (테이블)",
+    "5: 테스트 데이터 생성",
+    "6: 데이터 롤백",
+    "7: MySQL 덤프",
     "Q: 종료",
 ]
 
@@ -720,10 +858,12 @@ class TUIApplication:
             elif c == ord('3'):
                 self.handle_analyze()
             elif c == ord('4'):
-                self.handle_generate()
+                self.handle_create_schema()
             elif c == ord('5'):
-                self.handle_rollback()
+                self.handle_generate()
             elif c == ord('6'):
+                self.handle_rollback()
+            elif c == ord('7'):
                 self.handle_dump()
             elif c in (ord('q'), ord('Q')):
                 break
@@ -826,7 +966,7 @@ class TUIApplication:
             self.stdscr.addstr(y + 1, 1, f"[진행] {progress}"[:w-2])
             
             # 명령어 안내
-            cmd_help = "명령: 1=프로파일 2=시나리오 3=분석 4=생성 5=롤백 6=덤프 Q=종료"
+            cmd_help = "명령: 1=프로파일 2=시나리오 3=분석 4=스키마생성 5=데이터생성 6=롤백 7=덤프 Q=종료"
             self.stdscr.addstr(y + 2, 1, cmd_help[:w-2], curses.color_pair(4))
         except:
             pass
@@ -886,6 +1026,66 @@ class TUIApplication:
             self.state.last_message = f"시나리오 '{selected_name}' 선택됨"
             self.state.add_log(f"시나리오 선택: {selected_name}")
 
+    def handle_create_schema(self):
+        """스키마 생성 (테이블 생성)"""
+        self.state.current_menu = 4
+        
+        if not self.state.current_profile:
+            self.state.last_message = "먼저 프로파일을 선택하세요 (메뉴 1)"
+            self.state.add_log("프로파일 미선택 경고")
+            return
+        
+        if not self.state.db_config:
+            try:
+                self.state.db_config = load_connection_config(self.state.current_profile)
+            except Exception as e:
+                self.state.last_message = f"DB 설정 로드 실패: {e}"
+                self.state.add_log(f"오류: {e}")
+                return
+        
+        self.state.progress = "스키마 생성 중..."
+        self.state.add_log("스키마 생성 시작")
+        self.draw()
+        self.stdscr.refresh()
+        
+        schema_file = os.path.join(CONFIG_DIR, self.state.current_profile, "schema.sql")
+        creator = SchemaCreator(schema_file, self.state.db_config)
+        
+        def progress_callback(table_name, current, total):
+            self.state.progress = f"테이블 '{table_name}' 생성 중... ({current}/{total})"
+            self.draw()
+            self.stdscr.refresh()
+        
+        try:
+            creator.connect()
+            self.state.add_log("DB 연결 성공")
+            results = creator.create_missing_tables(progress_callback)
+            
+            # 결과 집계
+            created = sum(1 for v in results.values() if v == "created")
+            exists = sum(1 for v in results.values() if v == "already_exists")
+            errors = sum(1 for v in results.values() if v.startswith("error"))
+            
+            self.state.last_message = f"스키마 생성 완료: 생성 {created}개, 기존 {exists}개, 오류 {errors}개"
+            self.state.add_log(f"생성 완료: {created}개 테이블 생성됨")
+            
+            # 상세 로그
+            for table, result in results.items():
+                if result == "created":
+                    self.state.add_log(f"  ✓ {table}: 생성됨")
+                elif result == "already_exists":
+                    self.state.add_log(f"  - {table}: 이미 존재")
+                else:
+                    self.state.add_log(f"  ✗ {table}: {result}")
+                    
+        except Exception as e:
+            self.state.last_message = f"스키마 생성 실패: {e}"
+            self.state.add_log(f"오류: {e}")
+        finally:
+            creator.close()
+            self.state.progress = ""
+            self.draw()
+
     def handle_analyze(self):
         """스키마/시나리오 분석"""
         self.state.current_menu = 3
@@ -929,7 +1129,7 @@ class TUIApplication:
 
     def handle_generate(self):
         """테스트 데이터 생성"""
-        self.state.current_menu = 4
+        self.state.current_menu = 5
         
         if not self.state.schema or not self.state.scenario:
             self.state.last_message = "먼저 스키마/시나리오 분석을 수행하세요 (메뉴 3)"
@@ -983,7 +1183,7 @@ class TUIApplication:
 
     def handle_rollback(self):
         """데이터 롤백"""
-        self.state.current_menu = 5
+        self.state.current_menu = 6
         self.state.progress = "롤백할 run 목록 조회 중..."
         self.state.add_log("롤백 목록 조회")
         self.draw()
@@ -1060,7 +1260,7 @@ class TUIApplication:
 
     def handle_dump(self):
         """MySQL 덤프"""
-        self.state.current_menu = 6
+        self.state.current_menu = 7
         
         if not self.state.db_config:
             if self.state.current_profile:
