@@ -186,15 +186,16 @@ Q: 종료
 
 ### 간단한 예제
 
-1. config/wpm/ 디렉토리에 connection.json, schema.sql 생성
-2. scenario/wpm/ 디렉토리에 test-1.json 생성
+1. config/example/ 디렉토리에 connection.json, schema.sql 생성
+2. scenario/example/ 디렉토리에 small-test.json 생성
 3. 프로그램 실행: `python mysql-test-data-provisioner.py`
-4. 메뉴 1에서 "wpm" 프로파일 선택
-5. 메뉴 2에서 "test-1.json" 시나리오 선택
+4. 메뉴 1에서 "example" 프로파일 선택
+5. 메뉴 2에서 "small-test.json" 시나리오 선택
 6. 메뉴 3에서 분석 실행
-7. 메뉴 4에서 데이터 생성
-   - 생성된 데이터 정보는 `work/wpm_tbl_test-1/` 디렉토리에 저장됨
-8. 필요 시 메뉴 5에서 롤백
+7. 메뉴 4에서 스키마 생성 (테이블 생성)
+8. 메뉴 5에서 데이터 생성
+   - 생성된 데이터 정보는 `work/example_small-test/` 디렉토리에 저장됨
+9. 필요 시 메뉴 6에서 롤백
 
 ## 트러블슈팅
 
