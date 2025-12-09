@@ -1,0 +1,47 @@
+# Project specific directories (keep example, ignore others)
+config/*
+!config/wpm/
+!config/example/
+scenario/*
+!scenario/wpm/
+!scenario/example/
+
+# Work directory (run logs)
+work/
+
+# Dump directory
+dump/
+
+# Lock file
+.mysql_testdata_generator.lock
+
+# Python virtual environments
+venv/
+env/
+ENV/
+.venv/
+.env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+

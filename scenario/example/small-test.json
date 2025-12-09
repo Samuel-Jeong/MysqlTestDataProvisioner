@@ -1,0 +1,39 @@
+{
+  "name": "Small Test Dataset",
+  "description": "소량 테스트 데이터 - 개발 및 단위 테스트용",
+  "tables": {
+    "customers": {
+      "count": 5
+    },
+    "categories": {
+      "count": 3
+    },
+    "products": {
+      "count": 10,
+      "relations": {
+        "category_id": "categories.id"
+      }
+    },
+    "orders": {
+      "count": 8,
+      "relations": {
+        "customer_id": "customers.id"
+      }
+    },
+    "order_items": {
+      "count": 20,
+      "relations": {
+        "order_id": "orders.id",
+        "product_id": "products.id"
+      }
+    },
+    "reviews": {
+      "count": 12,
+      "relations": {
+        "product_id": "products.id",
+        "customer_id": "customers.id"
+      }
+    }
+  }
+}
+
