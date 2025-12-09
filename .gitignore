@@ -1,6 +1,8 @@
 # Project specific directories (keep example, ignore others)
-config/
-scenario/
+config/*
+!config/example/
+scenario/*
+!scenario/example/
 
 # Work directory (run logs)
 work/
