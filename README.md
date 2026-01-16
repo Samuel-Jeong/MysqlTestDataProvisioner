@@ -13,6 +13,131 @@ MySQL 데이터베이스를 위한 자동 테스트 데이터 생성 및 관리 
 7. **중복 실행 방지** - 락 파일 기반
 8. **TUI 인터페이스** - 직관적인 터미널 UI
 
+## 전체 아키텍처(컴포넌트) 다이어그램
+```mermaid
+flowchart LR
+  subgraph User["사용자"]
+    T["TUI 조작<br/>프로파일/시나리오 선택<br/>생성/롤백/덤프 실행"]
+  end
+
+  subgraph App["mysql-test-data-provisioner.py (TUI 앱)"]
+    UI["TUI Menu<br/>1 Profile<br/>2 Scenario<br/>3 Analyze<br/>4 Create Schema<br/>5 Generate Data<br/>6 Rollback<br/>7 Dump"]
+    CFG["Config Loader<br/>config/{profile}/connection.json<br/>config/{profile}/schema.sql"]
+    SCN["Scenario Loader<br/>scenario/{profile}/*.json"]
+    ANA["Analyzer<br/>- schema.sql 파싱(CREATE TABLE)<br/>- 시나리오 검증(테이블/관계)"]
+    DB["MySQL Executor<br/>- CREATE (없는 테이블만)<br/>- INSERT / DELETE"]
+    RUN["Run Manager<br/>run_id 생성(YYYYMMDDHHmmss)<br/>생성된 PK 기록"]
+    LOCK["Lock Manager<br/>.mysql_testdata_generator.lock"]
+    DUMP["Dump Manager<br/>mysqldump 백업"]
+  end
+
+  subgraph Files["파일 시스템(자동 생성 포함)"]
+    WORK["work/{profile}_{scenario}/<br/>run_*.json (실행 로그/PK)"]
+    DUMPDIR["dump/<br/>mysqldump 출력"]
+  end
+
+  subgraph MySQL["MySQL DB"]
+    TABLES["기존 테이블(보호)<br/>새 테이블(없으면 생성)"]
+    ROWS["데이터(INSERT/DELETE)"]
+  end
+
+  T --> UI
+  UI --> LOCK
+  UI --> CFG
+  UI --> SCN
+  UI --> ANA
+  UI --> DB
+  UI --> RUN
+  UI --> DUMP
+
+  CFG --> ANA
+  SCN --> ANA
+  ANA --> DB
+
+  DB --> TABLES
+  DB --> ROWS
+
+  RUN --> WORK
+  DUMP --> DUMPDIR
+```
+
+## TUI 사용 흐름(시퀀스 다이어그램)
+```mermaid
+sequenceDiagram
+  autonumber
+  participant U as User
+  participant UI as TUI(Menu)
+  participant L as Lock Manager
+  participant C as Config Loader
+  participant S as Scenario Loader
+  participant A as Analyzer
+  participant DB as MySQL Executor
+  participant R as Run Manager
+  participant FS as work/ dump/
+
+  U->>UI: 프로그램 실행
+  UI->>L: 락 파일 생성/검사<br/>(.mysql_testdata_generator.lock)
+  U->>UI: 1) 프로파일 선택
+  UI->>C: connection.json + schema.sql 로드
+  U->>UI: 2) 시나리오 선택
+  UI->>S: scenario JSON 로드
+  U->>UI: 3) 스키마/시나리오 분석
+  UI->>A: schema 파싱 + scenario 검증
+  A-->>UI: 분석 결과/오류 표시
+
+  opt 4) 스키마 생성(선택)
+    UI->>DB: DB에 없는 테이블만 CREATE<br/>기존 테이블은 보호
+  end
+
+  U->>UI: 5) 테스트 데이터 생성
+  UI->>R: run_id 생성
+  UI->>DB: 시나리오 기반 INSERT<br/>relations로 FK 채움
+  DB-->>R: 생성된 PK 수집
+  R->>FS: run_*.json 저장<br/>(work/{profile}_{scenario}/)
+
+  opt 7) MySQL 덤프(선택)
+    UI->>DB: mysqldump 실행
+    DB->>FS: dump/에 파일 저장
+  end
+
+  opt 6) 롤백(선택)
+    UI->>R: 이전 run 목록 로드
+    UI->>DB: 선택 run의 PK로 DELETE
+    DB-->>UI: 롤백 완료
+  end
+```
+
+## 데이터 생성과 관계(relations) 처리 흐름
+```mermaid
+flowchart TB
+  IN["scenario.json<br/>tables.*.count<br/>tables.*.relations"] --> ORDER["테이블 처리 순서<br/>부모 → 자식(중요)"]
+  ORDER --> GENP["부모 테이블 레코드 생성<br/>INSERT 후 PK 확보"]
+  GENP --> GENC["자식 테이블 레코드 생성"]
+  GENC --> FK["relations 처리<br/>예: user_id = users.id<br/>부모 PK를 랜덤 선택해 FK에 할당"]
+  FK --> INS["INSERT 실행"]
+  INS --> LOG["run_*.json에 PK 기록<br/>(롤백용)"]
+```
+
+## 롤백 시스템( run 단위 삭제, FK 위반 방지 )
+```mermaid
+flowchart TB
+  LIST["이전 실행(run) 목록 표시"] --> PICK["사용자가 run 선택"]
+  PICK --> LOAD["work/{profile}_{scenario}/run_*.json 로드<br/>테이블별 생성 PK 목록"]
+  LOAD --> REV["삭제 순서 역전<br/>자식 테이블 → 부모 테이블"]
+  REV --> DEL["PK 기반 DELETE 실행"]
+  DEL --> DONE["선택 run 데이터만 삭제 완료<br/>스키마는 변경하지 않음"]
+```
+
+## 디렉터리 구조(산출물 중심)
+```mermaid
+flowchart TB
+  ROOT["MysqlTestDataProvisioner/"] --> CFG["config/{profile}/<br/>connection.json<br/>schema.sql"]
+  ROOT --> SCN["scenario/{profile}/<br/>*.json"]
+  ROOT --> WORK["work/{profile}_{scenario}/<br/>run_*.json"]
+  ROOT --> DUMP["dump/<br/>mysqldump 결과"]
+  ROOT --> APP["mysql-test-data-provisioner.py"]
+```
+
 ## 설치
 
 ```bash
