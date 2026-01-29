@@ -1,0 +1,24 @@
+{
+  "name": "Auto Relations Test",
+  "description": "자동 관계 매핑 테스트 - relations 필드 없이 스키마 기반 자동 FK 감지",
+  "tables": {
+    "customers": {
+      "count": 5
+    },
+    "categories": {
+      "count": 3
+    },
+    "products": {
+      "count": 10
+    },
+    "orders": {
+      "count": 8
+    },
+    "order_items": {
+      "count": 20
+    },
+    "reviews": {
+      "count": 12
+    }
+  }
+}

@@ -161,6 +161,7 @@ class ColumnInfo:
     is_primary: bool = False
     is_nullable: bool = True
     has_default: bool = False
+    foreign_key: Optional[str] = None  # "parent_table.parent_column" 형식
 
 
 @dataclass
@@ -179,7 +180,6 @@ class SchemaInfo:
 class ScenarioTable:
     name: str
     count: int
-    relations: Dict[str, str] = field(default_factory=dict)  # column_name -> "parent_table.parent_pk"
 
 
 @dataclass
@@ -225,6 +225,9 @@ class MySQLSchemaParser:
             table_info = self._parse_table_block(block)
             if table_info is not None:
                 schema.tables[table_info.name] = table_info
+
+        # FK 자동 감지
+        self._detect_foreign_keys(schema)
 
         return schema
     
@@ -334,6 +337,55 @@ class MySQLSchemaParser:
                     continue
 
         return table
+    
+    def _detect_foreign_keys(self, schema: SchemaInfo):
+        """
+        스키마 내 모든 테이블을 분석하여 FK 관계를 자동 감지
+        
+        감지 규칙:
+        1. FOREIGN KEY 제약조건 명시적 파싱
+        2. 명명 규칙: {table_name}_id -> {table_name}.id
+           예: customer_id -> customers.id (단수형->복수형 변환 시도)
+        """
+        # 테이블 이름 목록 (단수형/복수형 매핑용)
+        table_names = set(schema.tables.keys())
+        
+        for table_name, table_info in schema.tables.items():
+            for col in table_info.columns:
+                # 이미 FK가 설정되어 있으면 스킵
+                if col.foreign_key:
+                    continue
+                
+                # PK는 FK가 될 수 없음
+                if col.is_primary:
+                    continue
+                
+                # _id로 끝나는 컬럼 분석
+                if col.name.endswith('_id'):
+                    # 컬럼명에서 '_id' 제거하여 참조 테이블명 추출
+                    ref_table_base = col.name[:-3]  # 'customer_id' -> 'customer'
+                    
+                    # 1. 정확히 일치하는 테이블 찾기
+                    if ref_table_base in table_names:
+                        ref_table = ref_table_base
+                    # 2. 복수형 시도 (간단한 규칙: +s)
+                    elif ref_table_base + 's' in table_names:
+                        ref_table = ref_table_base + 's'
+                    # 3. 복수형 시도 (es)
+                    elif ref_table_base + 'es' in table_names:
+                        ref_table = ref_table_base + 'es'
+                    # 4. y -> ies 변환 (category -> categories)
+                    elif ref_table_base.endswith('y') and ref_table_base[:-1] + 'ies' in table_names:
+                        ref_table = ref_table_base[:-1] + 'ies'
+                    else:
+                        # 매칭되는 테이블을 찾지 못함
+                        continue
+                    
+                    # 참조 테이블의 PK 확인
+                    ref_table_info = schema.tables.get(ref_table)
+                    if ref_table_info and ref_table_info.primary_key:
+                        # FK 관계 설정
+                        col.foreign_key = f"{ref_table}.{ref_table_info.primary_key}"
 
 
 # ==========================
@@ -346,14 +398,11 @@ class ScenarioLoader:
     {
       "tables": {
         "users": { "count": 10 },
-        "orders": {
-          "count": 30,
-          "relations": {
-            "user_id": "users.id"
-          }
-        }
+        "orders": { "count": 30 }
       }
     }
+    
+    FK 관계는 스키마에서 자동으로 감지됩니다.
     """
 
     def __init__(self, scenario_file: str):
@@ -369,11 +418,9 @@ class ScenarioLoader:
         tables = {}
         for tname, tinfo in data.get("tables", {}).items():
             count = int(tinfo.get("count", 0))
-            relations = tinfo.get("relations", {}) or {}
             tables[tname] = ScenarioTable(
                 name=tname,
                 count=count,
-                relations=relations,
             )
 
         return ScenarioInfo(tables=tables)
@@ -580,10 +627,10 @@ class TestDataGenerator:
         inserted_rows: Dict[str, List[int]],
     ) -> Tuple[List[str], List[Any]]:
         """
-        단순한 랜덤 값 생성 + relations 반영
+        단순한 랜덤 값 생성 + 스키마 기반 FK 처리
         - VARCHAR류: 랜덤 문자열
         - INT류: 랜덤 정수
-        - relations에 정의된 FK는 부모 테이블에서 랜덤 PK 선택
+        - 스키마에서 자동 감지된 FK는 부모 테이블에서 랜덤 PK 선택
         """
         col_names = []
         values = []
@@ -593,10 +640,10 @@ class TestDataGenerator:
             if col.is_primary:
                 continue
 
-            # relations 처리 (FK)
-            if col.name in scenario_table.relations:
-                rel = scenario_table.relations[col.name]  # "parent_table.parent_pk"
-                parent_table, parent_pk = rel.split(".")
+            # FK 처리: 스키마에서 자동 감지된 FK 사용
+            if col.foreign_key:
+                # FK 값 생성: "parent_table.parent_pk"
+                parent_table, parent_pk = col.foreign_key.split(".")
                 parent_ids = inserted_rows.get(parent_table, [])
                 if not parent_ids:
                     # 부모 데이터가 아직 없으면 NULL (또는 나중에 보완 가능)
@@ -1120,6 +1167,16 @@ class TUIApplication:
             self.state.last_message = f"분석 완료: 테이블 {len(schema.tables)}개, 시나리오 테이블 {len(scenario.tables)}개"
             self.state.add_log(f"스키마 분석 완료: {len(schema.tables)}개 테이블")
             self.state.add_log(f"시나리오 로드 완료: {len(scenario.tables)}개 테이블")
+            
+            # 자동 감지된 FK 관계 로깅
+            fk_count = 0
+            for table_name, table_info in schema.tables.items():
+                for col in table_info.columns:
+                    if col.foreign_key:
+                        self.state.add_log(f"  FK 감지: {table_name}.{col.name} -> {col.foreign_key}")
+                        fk_count += 1
+            if fk_count > 0:
+                self.state.add_log(f"총 {fk_count}개의 FK 관계 자동 감지됨")
         except Exception as e:
             self.state.last_message = f"분석 실패: {e}"
             self.state.add_log(f"오류: {e}")
